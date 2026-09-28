@@ -9,7 +9,7 @@ mod parser;
 // Re-export command modules for routing
 use cmds::cloud::{aws_cmd, container, curl_cmd, psql_cmd, wget_cmd};
 use cmds::dotnet::{binlog, dotnet_cmd, dotnet_format_report, dotnet_trx};
-use cmds::git::{diff_cmd, gh_cmd, git, glab_cmd, gt_cmd};
+use cmds::git::{diff_cmd, gh_cmd, git_cmd, glab_cmd, gt_cmd};
 use cmds::go::{go_cmd, golangci_cmd};
 use cmds::js::{
     bun_cmd, deno_cmd, lint_cmd, next_cmd, npm_cmd, playwright_cmd, pnpm_cmd, prettier_cmd,
@@ -24,8 +24,8 @@ use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::scala::sbt_cmd;
 use cmds::system::{
-    ctest_cmd, deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
-    read, search, summary, tree, wc_cmd,
+    ast_grep_cmd, ctest_cmd, deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls,
+    pipe_cmd, read, search, summary, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -41,6 +41,8 @@ pub enum AgentTarget {
     Claude,
     /// Cursor Agent (editor and CLI)
     Cursor,
+    /// Trae IDE
+    Trae,
     /// Windsurf IDE (Cascade)
     Windsurf,
     /// Cline / Roo Code (VS Code)
@@ -111,11 +113,16 @@ enum Commands {
         /// Filter: none (default, full content), minimal, aggressive
         #[arg(short, long, default_value = "none")]
         level: core::filter::FilterLevel,
-        /// Max lines
-        #[arg(short, long, conflicts_with = "tail_lines")]
+        /// Structural preview capped at N lines (keeps signatures and imports;
+        /// not the first N lines — use --head-lines for that)
+        #[arg(short, long, conflicts_with_all = ["head_lines", "tail_lines"])]
         max_lines: Option<usize>,
+        /// Keep only the first N lines (byte-exact at the default --level none
+        /// with -n off; --level and -n still transform the window)
+        #[arg(long, conflicts_with_all = ["max_lines", "tail_lines"])]
+        head_lines: Option<usize>,
         /// Keep only last N lines
-        #[arg(long, conflicts_with = "max_lines")]
+        #[arg(long, conflicts_with_all = ["max_lines", "head_lines"])]
         tail_lines: Option<usize>,
         /// Show line numbers
         #[arg(short = 'n', long)]
@@ -219,19 +226,33 @@ enum Commands {
         #[arg(long, short = 'F')]
         filter: Vec<String>,
 
+        /// Recursive across workspace packages (pnpm -r)
+        #[arg(long, short = 'r')]
+        recursive: bool,
+
+        /// Run in the workspace root (pnpm -w)
+        #[arg(long = "workspace-root", short = 'w')]
+        workspace_root: bool,
+
         #[command(subcommand)]
         command: PnpmCommands,
     },
 
     /// Run command and show only errors/warnings
     Err {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Command to run
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
 
     /// Run tests and show only failures
     Test {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Test command (e.g. cargo test)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -271,6 +292,9 @@ enum Commands {
     },
 
     /// Ultra-condensed diff (only changed lines)
+    ///
+    /// Comparing two files exits 0 if identical, 1 if different, and 2 on a
+    /// file-read error. Non-UTF-8 files are compared byte for byte.
     Diff {
         /// First file or - for stdin (unified diff)
         file1: PathBuf,
@@ -310,8 +334,11 @@ enum Commands {
 
     /// Run command and show heuristic summary
     Summary {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Command to run and summarize
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
 
@@ -351,6 +378,13 @@ enum Commands {
     /// Compact ripgrep - runs rg natively, same output filter as grep
     Rg {
         /// Pattern, path, and any rg flags (e.g. -v, -i, -t rust, --glob)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+
+    /// Compact ast-grep - runs ast-grep natively, groups matches by file
+    AstGrep {
+        /// ast-grep subcommand, pattern, path, and any flags (e.g. run -p '$$$', --json)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -405,7 +439,7 @@ enum Commands {
         #[arg(long)]
         uninstall: bool,
 
-        /// Target Codex CLI (uses AGENTS.md + RTK.md, no Claude hook patching)
+        /// Target Codex CLI (uses PreToolUse hook + AGENTS.md + RTK.md)
         #[arg(long)]
         codex: bool,
 
@@ -673,12 +707,20 @@ enum Commands {
         min_occurrences: usize,
     },
 
-    /// Execute a shell command via sh -c (raw, no filtering or tracking)
+    /// Execute argv directly, or a command string through an explicit shell
     Run {
-        /// Command string to execute (use -c for shell-like invocation)
-        #[arg(short = 'c', long = "command")]
+        /// Command string to execute through a shell
+        #[arg(short = 'c', long = "command", conflicts_with = "args")]
         command: Option<String>,
-        /// Positional command arguments (alternative to -c)
+        /// Shell used with -c (defaults to sh on Unix and cmd on Windows)
+        #[arg(
+            long,
+            value_name = "SHELL",
+            requires = "command",
+            conflicts_with = "args"
+        )]
+        shell: Option<String>,
+        /// Program and literal arguments for direct execution (alternative to -c)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -953,6 +995,10 @@ enum Commands {
 enum HookCommands {
     /// Process Claude Code PreToolUse hook (reads JSON from stdin)
     Claude,
+    /// Process Trae PreToolUse hook (reads JSON from stdin)
+    Trae,
+    /// Process Codex CLI PreToolUse hook (reads JSON from stdin)
+    Codex,
     /// Process Cursor Agent hook (reads JSON from stdin)
     Cursor,
     /// Process Gemini CLI BeforeTool hook (reads JSON from stdin)
@@ -1517,6 +1563,8 @@ fn configured_awareness_level() -> core::config::AwarenessLevel {
 }
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
+    use crate::core::utils::ChildArgExt;
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // No args → show Clap's error (user ran just "rtk" with bad syntax)
@@ -1527,6 +1575,22 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     // RTK meta-commands should never fall back to raw execution.
     // e.g. `rtk gain --badtypo` should show Clap's error, not try to run `gain` from $PATH.
     if core::constants::RTK_META_COMMANDS.contains(&args[0].as_str()) {
+        parse_error.exit();
+    }
+
+    // `rtk test` deliberately shadows the POSIX `test` binary, so it cannot join
+    // that list — but a misused `--shell` is RTK's own flag, not something to
+    // hand to `test`. Without this, `rtk test --shell` execs the real `test`
+    // with no arguments and exits 0, silently ignoring the request (#4125).
+    //
+    // Scoped to `test` alone: `--shell` is a flag other tools carry too, and an
+    // argv-wide scan would refuse to run `just --shell bash` or
+    // `hyperfine --shell=none` — including the spellings the hook itself emits.
+    if args[0] == "test"
+        && args
+            .iter()
+            .any(|arg| arg == "--shell" || arg.starts_with("--shell="))
+    {
         parse_error.exit();
     }
 
@@ -1559,14 +1623,14 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
         let result = if filter.filter_stderr {
             // Merge stderr into stdout so the filter can strip banners emitted by tools like liquibase
             core::utils::resolved_command(&args[0])
-                .args(&args[1..])
+                .child_args(&args[1..])
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped()) // captured for merging
                 .output()
         } else {
             core::utils::resolved_command(&args[0])
-                .args(&args[1..])
+                .child_args(&args[1..])
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::piped()) // capture
                 .stderr(std::process::Stdio::inherit()) // stderr always direct
@@ -1635,7 +1699,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     } else {
         // No TOML match: original passthrough behaviour (Stdio::inherit, streaming)
         let status = core::utils::resolved_command(&args[0])
-            .args(&args[1..])
+            .child_args(&args[1..])
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -1722,20 +1786,58 @@ fn build_k8s_logs_args(pod: String, container: Option<String>) -> Vec<String> {
     args
 }
 
-/// Merge pnpm global filters args with other ones for standard String-based commands
-fn merge_pnpm_args(filters: &[String], args: &[String]) -> Vec<String> {
-    filters
-        .iter()
-        .map(|filter| format!("--filter={}", filter))
+/// Leading pnpm global flags (recursive / workspace-root), forwarded to pnpm.
+///
+/// These are appended *after* the subcommand by the callers (e.g. `run_install`
+/// builds `pnpm install <flags>`), i.e. `pnpm -r install` typed by the user runs
+/// as `pnpm install -r`. This is behavior-preserving: `-r`/`-w`/`--filter` are
+/// root-level pnpm options accepted in either position (same established pattern
+/// already used for `--filter`). Verified against pnpm 9.15.4: `pnpm install
+/// --help` lists `-r, --recursive`, `-w, --workspace-root` and `--filter` as
+/// options of `install` itself, and `pnpm <flag> <sub>` vs `pnpm <sub> <flag>`
+/// produce byte-identical output on `ls` and `outdated` for all three flags. If a
+/// future pnpm makes position significant, emit these before the subcommand
+/// instead (as the passthrough path already does via merge order).
+fn pnpm_global_flags(recursive: bool, workspace_root: bool) -> Vec<String> {
+    let mut flags = Vec::new();
+    if recursive {
+        flags.push("-r".to_string());
+    }
+    if workspace_root {
+        flags.push("-w".to_string());
+    }
+    flags
+}
+
+/// Merge pnpm global flags + filters with the subcommand args (String-based commands).
+fn merge_pnpm_args(
+    filters: &[String],
+    recursive: bool,
+    workspace_root: bool,
+    args: &[String],
+) -> Vec<String> {
+    pnpm_global_flags(recursive, workspace_root)
+        .into_iter()
+        .chain(filters.iter().map(|filter| format!("--filter={}", filter)))
         .chain(args.iter().cloned())
         .collect()
 }
 
-/// Merge pnpm global filters args with other ones, using OsString for passthrough compatibility
-fn merge_pnpm_args_os(filters: &[String], args: &[OsString]) -> Vec<OsString> {
-    filters
-        .iter()
-        .map(|filter| OsString::from(format!("--filter={}", filter)))
+/// Same as `merge_pnpm_args` but OsString-based, for passthrough compatibility.
+fn merge_pnpm_args_os(
+    filters: &[String],
+    recursive: bool,
+    workspace_root: bool,
+    args: &[OsString],
+) -> Vec<OsString> {
+    pnpm_global_flags(recursive, workspace_root)
+        .into_iter()
+        .map(OsString::from)
+        .chain(
+            filters
+                .iter()
+                .map(|filter| OsString::from(format!("--filter={}", filter))),
+        )
         .chain(args.iter().cloned())
         .collect()
 }
@@ -1758,6 +1860,33 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
                 return Some(msg);
             }
             None
+        }
+        _ => None,
+    }
+}
+
+/// Warn when pnpm global flags (`-r`/`-w`) are dropped for subcommands that don't
+/// forward them (Typecheck delegates to `tsc` and ignores them), mirroring the
+/// `--filter` warning in `validate_pnpm_filters`. Not reachable via the hook
+/// rewriter (`typecheck` isn't a rewritten pnpm subcommand) but possible manually.
+fn validate_pnpm_globals(
+    recursive: bool,
+    workspace_root: bool,
+    command: &PnpmCommands,
+) -> Option<String> {
+    match command {
+        PnpmCommands::Typecheck { .. } if recursive || workspace_root => {
+            let mut flags = Vec::new();
+            if recursive {
+                flags.push("-r");
+            }
+            if workspace_root {
+                flags.push("-w");
+            }
+            Some(format!(
+                "[rtk] warning: pnpm tsc does not support {} — ignored",
+                flags.join(", ")
+            ))
         }
         _ => None,
     }
@@ -1811,6 +1940,8 @@ where
 {
     if agent == Some(AgentTarget::Hermes) {
         uninstall_hermes(ctx)
+    } else if agent == Some(AgentTarget::Trae) {
+        hooks::init::uninstall_trae_mode(global, ctx)
     } else if agent == Some(AgentTarget::Droid) {
         hooks::init::uninstall_droid(global, ctx)
     } else if agent == Some(AgentTarget::Vibe) {
@@ -1833,6 +1964,94 @@ fn is_native_test_expression(command: &[String]) -> bool {
     }
 }
 
+/// Strip the shell grouping a command carries, returning how many negations were
+/// removed along with the command itself.
+///
+/// `!` and `( … )` are both `test`'s syntax and the shell's, and
+/// [`is_native_test_expression`] already treats them as possible native
+/// prefixes. A command behind them is not a native expression, so it runs
+/// through the test filter — and the negation and grouping the joined `sh -c`
+/// string used to get from the shell have to come from somewhere.
+///
+/// They nest, so they are stripped in one loop until neither applies: a single
+/// pass of each leaves `! ( cmd )` with `(` as its program, which is not found
+/// — and the negation would then turn that 127 into a reported *pass* for a
+/// command that never ran.
+fn split_leading_negations(command: Vec<String>) -> (usize, Vec<String>) {
+    let mut command = command;
+    let mut negations = 0;
+
+    loop {
+        let bangs = command.iter().take_while(|token| *token == "!").count();
+        // All `!` and nothing to negate: leave it alone so the runner reports it.
+        if bangs > 0 && bangs < command.len() {
+            negations += bangs;
+            command = command[bangs..].to_vec();
+            continue;
+        }
+        if let Some(grouped) = strip_outer_group(&command) {
+            command = grouped;
+            continue;
+        }
+        return (negations, command);
+    }
+}
+
+/// Peel one `( … )` that wraps the whole command.
+///
+/// The parentheses must balance across the command, so `( a ) b ( c )` — where
+/// the first `(` closes before the end — keeps both of them.
+fn strip_outer_group(command: &[String]) -> Option<Vec<String>> {
+    if command.len() <= 2 || command.first()? != "(" || command.last()? != ")" {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (index, token) in command.iter().enumerate() {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        if depth == 0 && index + 1 < command.len() {
+            return None;
+        }
+    }
+
+    (depth == 0).then(|| command[1..command.len() - 1].to_vec())
+}
+
+/// `--shell` runs one complete script, so it takes exactly one positional.
+///
+/// Clap cannot express "exactly one value for this positional when that flag is
+/// present", and `run` spells the same rule as `conflicts_with`/`requires`
+/// around its own `-c`. Enforcing it here keeps the other three surfaces
+/// answering with a usage error instead of failing mid-execution — reported by
+/// the subcommand that was asked, so the usage line names it.
+fn require_single_script(subcommand: &str, shell: Option<&str>, command: &[String]) {
+    use clap::CommandFactory;
+
+    if shell.is_none() || command.len() == 1 {
+        return;
+    }
+
+    let mut cli = Cli::command();
+    let mut surface = cli
+        .find_subcommand_mut(subcommand)
+        .expect("every caller names its own subcommand")
+        .clone()
+        // Taken on its own, the subcommand's usage line reads `test …` — the
+        // name of the POSIX utility `rtk test` shadows. Spell the binary the
+        // caller actually typed.
+        .bin_name(format!("rtk {subcommand}"));
+    surface
+        .error(
+            ErrorKind::WrongNumberOfValues,
+            core::shell::SHELL_ARITY_MESSAGE,
+        )
+        .exit();
+}
+
 fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
@@ -1848,8 +2067,11 @@ fn run_cli() -> Result<i32> {
     };
 
     // Warn if installed hook is outdated/missing (1/day, non-blocking).
-    // Skip for Gain — it shows its own inline hook warning.
-    if !matches!(cli.command, Commands::Gain { .. }) {
+    // Skip for Gain (shows its own inline warning), Init/Verify (manage the hook themselves).
+    if !matches!(
+        cli.command,
+        Commands::Gain { .. } | Commands::Init { .. } | Commands::Verify { .. }
+    ) {
         hooks::hook_check::maybe_warn();
     }
 
@@ -1870,6 +2092,7 @@ fn run_cli() -> Result<i32> {
             files,
             level,
             max_lines,
+            head_lines,
             tail_lines,
             line_numbers,
         } => {
@@ -1882,12 +2105,20 @@ fn run_cli() -> Result<i32> {
                         continue;
                     }
                     stdin_seen = true;
-                    read::run_stdin(level, max_lines, tail_lines, line_numbers, cli.verbose)
+                    read::run_stdin(
+                        level,
+                        max_lines,
+                        head_lines,
+                        tail_lines,
+                        line_numbers,
+                        cli.verbose,
+                    )
                 } else {
                     read::run(
                         file,
                         level,
                         max_lines,
+                        head_lines,
                         tail_lines,
                         line_numbers,
                         cli.verbose,
@@ -1898,11 +2129,7 @@ fn run_cli() -> Result<i32> {
                     had_error = true;
                 }
             }
-            if had_error {
-                1
-            } else {
-                0
-            }
+            if had_error { 1 } else { 0 }
         }
 
         Commands::Smart {
@@ -1957,90 +2184,100 @@ fn run_cli() -> Result<i32> {
             }
 
             match command {
-                GitCommands::Diff { args } => git::run(
-                    git::GitCommand::Diff,
+                GitCommands::Diff { args } => git_cmd::run(
+                    git_cmd::GitCommand::Diff,
                     &args,
                     None,
                     cli.verbose,
                     &global_args,
                 )?,
-                GitCommands::Log { args } => {
-                    git::run(git::GitCommand::Log, &args, None, cli.verbose, &global_args)?
+                GitCommands::Log { args } => git_cmd::run(
+                    git_cmd::GitCommand::Log,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Status { args } => git_cmd::run(
+                    git_cmd::GitCommand::Status,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Show { args } => git_cmd::run(
+                    git_cmd::GitCommand::Show,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Add { args } => git_cmd::run(
+                    git_cmd::GitCommand::Add,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Commit { args } => git_cmd::run(
+                    git_cmd::GitCommand::Commit,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Checkout { args } => git_cmd::run(
+                    git_cmd::GitCommand::Checkout,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Push { args } => git_cmd::run(
+                    git_cmd::GitCommand::Push,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Pull { args } => git_cmd::run(
+                    git_cmd::GitCommand::Pull,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Branch { args } => git_cmd::run(
+                    git_cmd::GitCommand::Branch,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Fetch { args } => git_cmd::run(
+                    git_cmd::GitCommand::Fetch,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Stash { subcommand, args } => git_cmd::run(
+                    git_cmd::GitCommand::Stash { subcommand },
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Worktree { args } => git_cmd::run(
+                    git_cmd::GitCommand::Worktree,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Other(args) => {
+                    git_cmd::run_passthrough(&args, &global_args, cli.verbose)?
                 }
-                GitCommands::Status { args } => git::run(
-                    git::GitCommand::Status,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Show { args } => git::run(
-                    git::GitCommand::Show,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Add { args } => {
-                    git::run(git::GitCommand::Add, &args, None, cli.verbose, &global_args)?
-                }
-                GitCommands::Commit { args } => git::run(
-                    git::GitCommand::Commit,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Checkout { args } => git::run(
-                    git::GitCommand::Checkout,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Push { args } => git::run(
-                    git::GitCommand::Push,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Pull { args } => git::run(
-                    git::GitCommand::Pull,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Branch { args } => git::run(
-                    git::GitCommand::Branch,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Fetch { args } => git::run(
-                    git::GitCommand::Fetch,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Stash { subcommand, args } => git::run(
-                    git::GitCommand::Stash { subcommand },
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Worktree { args } => git::run(
-                    git::GitCommand::Worktree,
-                    &args,
-                    None,
-                    cli.verbose,
-                    &global_args,
-                )?,
-                GitCommands::Other(args) => git::run_passthrough(&args, &global_args, cli.verbose)?,
             }
         }
 
@@ -2071,47 +2308,71 @@ fn run_cli() -> Result<i32> {
 
         Commands::Psql { args } => psql_cmd::run(&args, cli.verbose)?,
 
-        Commands::Pnpm { filter, command } => {
+        Commands::Pnpm {
+            filter,
+            recursive,
+            workspace_root,
+            command,
+        } => {
             // Warns user if filters are used with unsupported subcommands like typecheck
             if let Some(warning) = validate_pnpm_filters(&filter, &command) {
+                eprintln!("{}", warning);
+            }
+            if let Some(warning) = validate_pnpm_globals(recursive, workspace_root, &command) {
                 eprintln!("{}", warning);
             }
 
             match command {
                 PnpmCommands::List { depth, args } => pnpm_cmd::run(
                     pnpm_cmd::PnpmCommand::List { depth },
-                    &merge_pnpm_args(&filter, &args),
+                    &merge_pnpm_args(&filter, recursive, workspace_root, &args),
                     cli.verbose,
                 )?,
                 PnpmCommands::Outdated { args } => pnpm_cmd::run(
                     pnpm_cmd::PnpmCommand::Outdated,
-                    &merge_pnpm_args(&filter, &args),
+                    &merge_pnpm_args(&filter, recursive, workspace_root, &args),
                     cli.verbose,
                 )?,
                 PnpmCommands::Install { args } => pnpm_cmd::run(
                     pnpm_cmd::PnpmCommand::Install,
-                    &merge_pnpm_args(&filter, &args),
+                    &merge_pnpm_args(&filter, recursive, workspace_root, &args),
                     cli.verbose,
                 )?,
                 PnpmCommands::Typecheck { args } => tsc_cmd::run(Some("pnpm"), &args, cli.verbose)?,
-                PnpmCommands::Other(args) => {
-                    pnpm_cmd::run_passthrough(&merge_pnpm_args_os(&filter, &args), cli.verbose)?
-                }
+                PnpmCommands::Other(args) => pnpm_cmd::run_passthrough(
+                    &merge_pnpm_args_os(&filter, recursive, workspace_root, &args),
+                    cli.verbose,
+                )?,
             }
         }
 
-        Commands::Err { command } => {
-            let cmd = command.join(" ");
-            runner::run_err(&cmd, cli.verbose)?
+        Commands::Err { shell, command } => {
+            require_single_script("err", shell.as_deref(), &command);
+            runner::run_err(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run err command")?
         }
 
-        Commands::Test { command } => {
-            if is_native_test_expression(&command) {
+        Commands::Test { shell, command } => {
+            require_single_script("test", shell.as_deref(), &command);
+            // A native `test` expression (`rtk test -f Cargo.toml`) still goes
+            // to the real `test` binary; `--shell` means the caller asked for a
+            // script, so it never takes that path.
+            if shell.is_none() && is_native_test_expression(&command) {
                 let args: Vec<OsString> = command.into_iter().map(OsString::from).collect();
                 core::runner::run_passthrough("test", &args, cli.verbose)?
             } else {
-                let cmd = command.join(" ");
-                runner::run_test(&cmd, cli.verbose)?
+                // `rtk test ! <cmd>` negates the command's exit status. The
+                // joined `sh -c` string used to get that from the shell; direct
+                // execution applies it here instead, so the boundaries survive
+                // and no shell is interposed for it.
+                let (negations, command) = split_leading_negations(command);
+                let code = runner::run_test(&command, shell.as_deref(), cli.verbose)
+                    .context("Failed to run test command")?;
+                if negations % 2 == 1 {
+                    i32::from(code == 0)
+                } else {
+                    code
+                }
             }
         }
 
@@ -2230,9 +2491,10 @@ fn run_cli() -> Result<i32> {
             OcCommands::Other(args) => container::run_oc_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Summary { command } => {
-            let cmd = command.join(" ");
-            summary::run(&cmd, cli.verbose)?
+        Commands::Summary { shell, command } => {
+            require_single_script("summary", shell.as_deref(), &command);
+            summary::run(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run summary command")?
         }
 
         Commands::Grep {
@@ -2248,6 +2510,7 @@ fn run_cli() -> Result<i32> {
             &extra_args,
             cli.verbose,
         )?,
+        Commands::AstGrep { extra_args } => ast_grep_cmd::run(&extra_args)?,
         Commands::Rg { extra_args } => {
             search::run(search::Engine::Rg, 80, 200, false, &extra_args, cli.verbose)?
         }
@@ -2295,7 +2558,9 @@ fn run_cli() -> Result<i32> {
                 }
             } else if uninstall && agent == Some(AgentTarget::Kilocode) {
                 if !global {
-                    anyhow::bail!("Kilo Code plugin is user-scoped. Use: rtk init -g --agent kilocode --uninstall");
+                    anyhow::bail!(
+                        "Kilo Code plugin is user-scoped. Use: rtk init -g --agent kilocode --uninstall"
+                    );
                 }
                 hooks::init::uninstall_kilocode(ctx)?;
             } else if uninstall {
@@ -2319,6 +2584,8 @@ fn run_cli() -> Result<i32> {
                 }
             } else if agent == Some(AgentTarget::Pi) {
                 hooks::init::run_pi_mode_with_patch_mode(global, patch_mode, ctx)?
+            } else if agent == Some(AgentTarget::Trae) {
+                hooks::init::run_trae_mode(global, ctx)?
             } else if agent == Some(AgentTarget::Omp) {
                 hooks::init::run_omp_mode_with_patch_mode(global, patch_mode, ctx)?
             } else if agent == Some(AgentTarget::Kilocode) {
@@ -2348,10 +2615,15 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_vibe_mode(global, hook_only, patch_mode, ctx)?;
             } else {
                 let install_opencode = opencode;
-                let install_claude = !opencode;
                 let install_cursor = agent == Some(AgentTarget::Cursor);
                 let install_windsurf = agent == Some(AgentTarget::Windsurf);
                 let install_cline = agent == Some(AgentTarget::Cline);
+                // Sibling agents (Cursor, Windsurf, Cline) fall through to this
+                // shared init path; only the default (no --agent) or an explicit
+                // Claude target should install Claude Code files. Without this
+                // guard, `rtk init -g --agent cursor` writes into ~/.claude (#2097).
+                let install_claude =
+                    !opencode && !install_cursor && !install_windsurf && !install_cline;
 
                 hooks::init::run(
                     global,
@@ -2775,6 +3047,14 @@ fn run_cli() -> Result<i32> {
                 hooks::hook_cmd::run_claude()?;
                 0
             }
+            HookCommands::Trae => {
+                hooks::hook_cmd::run_trae()?;
+                0
+            }
+            HookCommands::Codex => {
+                hooks::hook_cmd::run_codex()?;
+                0
+            }
             HookCommands::Cursor => {
                 hooks::hook_cmd::run_cursor()?;
                 0
@@ -2842,24 +3122,55 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Run { command, args } => {
-            let raw = match command {
-                Some(c) => c,
-                None if !args.is_empty() => args.join(" "),
-                None => String::new(),
-            };
-            if raw.trim().is_empty() {
+        Commands::Run {
+            command,
+            shell,
+            args,
+        } => {
+            if command
+                .as_deref()
+                .is_none_or(|script| script.trim().is_empty())
+                && args.is_empty()
+            {
                 0
             } else {
-                use std::process::Command as ProcCommand;
-                let shell = if cfg!(windows) { "cmd" } else { "sh" };
-                let flag = if cfg!(windows) { "/C" } else { "-c" };
-                let status = ProcCommand::new(shell)
-                    .arg(flag)
-                    .arg(&raw)
-                    .status()
-                    .with_context(|| format!("Failed to execute: {}", raw))?;
-                core::utils::exit_code_from_status(&status, "run")
+                let (launch, description, program) = match command {
+                    Some(script) => (
+                        core::shell::shell_command(&script, shell.as_deref())
+                            .context("Failed to prepare run shell command")?,
+                        format!("shell command: {script}"),
+                        core::shell::program_name(&[], shell.as_deref()).to_string(),
+                    ),
+                    None => (
+                        core::shell::direct_command(&args)
+                            .context("Failed to prepare direct run command")?,
+                        core::shell::display_args(&args),
+                        core::shell::program_name(&args, None).to_string(),
+                    ),
+                };
+                match launch {
+                    core::shell::Launch::Ready(mut prepared) => match prepared.status() {
+                        Ok(status) => core::utils::exit_code_from_status(&status, "run"),
+                        Err(error) => {
+                            let error = anyhow::Error::new(error)
+                                .context(format!("Failed to execute {description}"));
+                            match core::shell::spawn_failure(&program, &error) {
+                                Some(outcome) => {
+                                    eprint!("{}", outcome.message);
+                                    outcome.code
+                                }
+                                None => return Err(error),
+                            }
+                        }
+                    },
+                    // `rtk run` is a raw passthrough, so it reports a program it
+                    // cannot run the way a shell does: the message on stderr and
+                    // the shell's own exit code.
+                    core::shell::Launch::Unrunnable(outcome) => {
+                        eprint!("{}", outcome.message);
+                        outcome.code
+                    }
+                }
             }
         }
 
@@ -2880,6 +3191,7 @@ fn run_cli() -> Result<i32> {
         })?,
 
         Commands::Proxy { args } => {
+            use crate::core::utils::ChildArgExt;
             use std::io::{Read, Write};
             use std::process::Stdio;
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -2930,11 +3242,17 @@ fn run_cli() -> Result<i32> {
                 unsafe extern "C" fn handle_signal(sig: libc::c_int) {
                     let pid = PROXY_CHILD_PID.load(Ordering::SeqCst);
                     if pid != 0 {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                        libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+                        // nosemgrep: unsafe-block
+                        unsafe {
+                            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+                        }
                     }
-                    libc::signal(sig, libc::SIG_DFL);
-                    libc::raise(sig);
+                    // nosemgrep: unsafe-block
+                    unsafe {
+                        libc::signal(sig, libc::SIG_DFL);
+                        libc::raise(sig);
+                    }
                 }
                 // nosemgrep: unsafe-block
                 unsafe {
@@ -2962,7 +3280,7 @@ fn run_cli() -> Result<i32> {
 
             let mut child = ChildGuard(Some(
                 core::utils::resolved_command(cmd_name.as_ref())
-                    .args(&cmd_args)
+                    .child_args(&cmd_args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -3124,6 +3442,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Summary { .. }
             | Commands::Grep { .. }
             | Commands::Rg { .. }
+            | Commands::AstGrep { .. }
             | Commands::Wget { .. }
             | Commands::Vitest { .. }
             | Commands::Ctest { .. }
@@ -3262,6 +3581,46 @@ mod tests {
     }
 
     #[test]
+    fn test_pnpm_recursive_install_parsing() {
+        // The rewriter emits `rtk pnpm -r install` for `pnpm -r install`; it must parse
+        // to Install with recursive=true (not error, not Other) so `-r` is forwarded.
+        let cli = Cli::try_parse_from(["rtk", "pnpm", "-r", "install"]).unwrap();
+        match cli.command {
+            Commands::Pnpm {
+                recursive,
+                workspace_root,
+                command,
+                ..
+            } => {
+                assert!(recursive);
+                assert!(!workspace_root);
+                assert!(matches!(command, PnpmCommands::Install { .. }));
+            }
+            _ => panic!("Expected Pnpm command"),
+        }
+    }
+
+    #[test]
+    fn test_pnpm_workspace_root_filter_install_parsing() {
+        let cli =
+            Cli::try_parse_from(["rtk", "pnpm", "-w", "--filter", "@app", "install"]).unwrap();
+        match cli.command {
+            Commands::Pnpm {
+                filter,
+                recursive,
+                workspace_root,
+                command,
+            } => {
+                assert!(!recursive);
+                assert!(workspace_root);
+                assert_eq!(filter, vec!["@app".to_string()]);
+                assert!(matches!(command, PnpmCommands::Install { .. }));
+            }
+            _ => panic!("Expected Pnpm command"),
+        }
+    }
+
+    #[test]
     fn test_git_commit_long_flag_multiple() {
         let cli = Cli::try_parse_from([
             "rtk",
@@ -3308,6 +3667,20 @@ mod tests {
         match cli.command {
             Commands::Init { agent, .. } => {
                 assert_eq!(agent, Some(AgentTarget::Hermes));
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_init_agent_trae_and_uninstall() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "trae", "--uninstall"]).unwrap();
+        match cli.command {
+            Commands::Init {
+                agent, uninstall, ..
+            } => {
+                assert_eq!(agent, Some(AgentTarget::Trae));
+                assert!(uninstall);
             }
             _ => panic!("Expected Init command"),
         }
@@ -3573,7 +3946,10 @@ mod tests {
         // RTK meta-commands should produce parse errors (not fall through to raw execution).
         // Skip "proxy" because it uses trailing_var_arg (accepts any args by design).
         for cmd in core::constants::RTK_META_COMMANDS {
-            if matches!(*cmd, "proxy" | "run" | "rewrite" | "session") {
+            if matches!(
+                *cmd,
+                "proxy" | "run" | "rewrite" | "session" | "err" | "summary"
+            ) {
                 continue; // these use trailing_var_arg (accept any args by design)
             }
             let result = Cli::try_parse_from(["rtk", cmd, "--nonexistent-flag-xyz"]);
@@ -3597,13 +3973,13 @@ mod tests {
             "tree",
             "read",
             "rg",
+            "ast-grep",
             "git",
             "gh",
             "glab",
             "aws",
             "psql",
             "pnpm",
-            "err",
             "test",
             "env",
             "find",
@@ -3613,7 +3989,6 @@ mod tests {
             "docker",
             "kubectl",
             "oc",
-            "summary",
             "grep",
             "wget",
             "wc",
@@ -3681,8 +4056,13 @@ mod tests {
     fn test_run_command_with_dash_c() {
         let cli = Cli::try_parse_from(["rtk", "run", "-c", "git status && echo done"]).unwrap();
         match cli.command {
-            Commands::Run { command, args } => {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
                 assert_eq!(command, Some("git status && echo done".to_string()));
+                assert!(shell.is_none());
                 assert!(args.is_empty());
             }
             _ => panic!("Expected Run command"),
@@ -3693,8 +4073,13 @@ mod tests {
     fn test_run_command_positional_args() {
         let cli = Cli::try_parse_from(["rtk", "run", "echo", "hello"]).unwrap();
         match cli.command {
-            Commands::Run { command, args } => {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
                 assert!(command.is_none());
+                assert!(shell.is_none());
                 assert_eq!(args, vec!["echo", "hello"]);
             }
             _ => panic!("Expected Run command"),
@@ -3713,12 +4098,52 @@ mod tests {
     }
 
     #[test]
+    fn test_run_command_with_explicit_shell() {
+        let cli =
+            Cli::try_parse_from(["rtk", "run", "--shell", "fish", "-c", "echo (pwd)"]).unwrap();
+        match cli.command {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
+                assert_eq!(command, Some("echo (pwd)".to_string()));
+                assert_eq!(shell, Some("fish".to_string()));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_shell_requires_command_string() {
+        assert!(Cli::try_parse_from(["rtk", "run", "--shell", "fish", "echo"]).is_err());
+    }
+
+    #[test]
     fn test_hook_claude_parses() {
         let cli = Cli::try_parse_from(["rtk", "hook", "claude"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Hook {
                 command: HookCommands::Claude
+            }
+        ));
+    }
+
+    #[test]
+    fn test_hook_trae_parses() {
+        let cli = Cli::try_parse_from(["rtk", "hook", "trae"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_hook_codex_parses() {
+        let cli = Cli::try_parse_from(["rtk", "hook", "codex"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Hook {
+                command: HookCommands::Codex
             }
         ));
     }
@@ -3888,7 +4313,10 @@ mod tests {
         let filters = vec![];
         let args = vec!["--depth=0".to_string(), "--no-verbose".to_string()];
         let expected_args = vec!["--depth=0", "--no-verbose"];
-        assert_eq!(merge_pnpm_args(&filters, &args), expected_args);
+        assert_eq!(
+            merge_pnpm_args(&filters, false, false, &args),
+            expected_args
+        );
     }
 
     #[test]
@@ -3906,7 +4334,10 @@ mod tests {
             "--depth=0",
             "--no-verbose",
         ];
-        assert_eq!(merge_pnpm_args(&filters, &args), expected_args);
+        assert_eq!(
+            merge_pnpm_args(&filters, false, false, &args),
+            expected_args
+        );
     }
 
     #[test]
@@ -3914,7 +4345,10 @@ mod tests {
         let filters = vec![];
         let args = vec![OsString::from("--depth=0")];
         let expected_args = vec![OsString::from("--depth=0")];
-        assert_eq!(merge_pnpm_args_os(&filters, &args), expected_args);
+        assert_eq!(
+            merge_pnpm_args_os(&filters, false, false, &args),
+            expected_args
+        );
     }
 
     #[test]
@@ -3925,7 +4359,39 @@ mod tests {
             OsString::from("--filter=@app1"),
             OsString::from("--depth=0"),
         ];
-        assert_eq!(merge_pnpm_args_os(&filters, &args), expected_args);
+        assert_eq!(
+            merge_pnpm_args_os(&filters, false, false, &args),
+            expected_args
+        );
+    }
+
+    #[test]
+    fn test_merge_recursive_workspace_root_ordering() {
+        // Global flags come first, then filters, then the subcommand args —
+        // executed as `pnpm <sub> -r -w --filter=@app <args>` (position-independent,
+        // verified empirically; see pnpm_global_flags docs).
+        let filters = vec!["@app".to_string()];
+        let args = vec!["--depth=0".to_string()];
+        assert_eq!(
+            merge_pnpm_args(&filters, true, true, &args),
+            vec!["-r", "-w", "--filter=@app", "--depth=0"]
+        );
+        // No flags → unchanged from the filters-only behavior.
+        assert_eq!(merge_pnpm_args(&[], false, false, &args), vec!["--depth=0"]);
+    }
+
+    #[test]
+    fn test_validate_pnpm_globals_warns_on_typecheck() {
+        let cmd = PnpmCommands::Typecheck { args: vec![] };
+        assert!(validate_pnpm_globals(true, false, &cmd).is_some());
+        assert!(validate_pnpm_globals(false, true, &cmd).is_some());
+        // Both flags at once: single warning naming both.
+        let both = validate_pnpm_globals(true, true, &cmd).unwrap();
+        assert!(both.contains("-r") && both.contains("-w"));
+        assert!(validate_pnpm_globals(false, false, &cmd).is_none());
+        // Non-typecheck subcommands forward the flags → no warning.
+        let install = PnpmCommands::Install { args: vec![] };
+        assert!(validate_pnpm_globals(true, true, &install).is_none());
     }
 
     #[test]
@@ -3939,6 +4405,7 @@ mod tests {
             Commands::Pnpm {
                 filter,
                 command: PnpmCommands::List { depth, args },
+                ..
             } => {
                 assert_eq!(depth, 0);
                 assert_eq!(filter, vec!["@app1", "@app2"]);
@@ -3999,7 +4466,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Pnpm { filter, command } => {
+            Commands::Pnpm {
+                filter, command, ..
+            } => {
                 let warning = validate_pnpm_filters(&filter, &command);
 
                 assert!(filter.is_empty());
@@ -4026,11 +4495,16 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Pnpm { filter, command } => {
+            Commands::Pnpm {
+                filter, command, ..
+            } => {
                 let warning = validate_pnpm_filters(&filter, &command).unwrap();
 
                 assert_eq!(filter, vec!["@app1", "@app2"]);
-                assert_eq!(warning, "[rtk] warning: --filter is not yet supported for pnpm tsc, filters preceding the subcommand will be ignored")
+                assert_eq!(
+                    warning,
+                    "[rtk] warning: --filter is not yet supported for pnpm tsc, filters preceding the subcommand will be ignored"
+                )
             }
             _ => panic!("Expected Pnpm Build command"),
         }

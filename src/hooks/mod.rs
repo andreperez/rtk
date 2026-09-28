@@ -17,15 +17,22 @@ pub mod rewrite_cmd;
 pub mod trust;
 pub mod verify_cmd;
 
-pub fn is_claude_hook_command(command: &str) -> bool {
+fn is_rtk_binary(binary: &str) -> bool {
+    let binary_name = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    matches!(binary_name, "rtk" | "rtk.exe")
+}
+
+fn is_rtk_hook_command(command: &str, agent: &str) -> bool {
     let parts = crate::discover::lexer::shell_split(command);
-    let [binary, hook, claude] = parts.as_slice() else {
+    let [parsed_binary, hook, target] = parts.as_slice() else {
         return false;
     };
 
-    let binary_name = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    is_rtk_binary(parsed_binary) && hook == "hook" && target == agent
+}
 
-    binary_name == "rtk" && hook == "hook" && claude == "claude"
+pub fn is_claude_hook_command(command: &str) -> bool {
+    is_rtk_hook_command(command, "claude")
 }
 
 #[cfg(test)]
@@ -38,6 +45,9 @@ mod tests {
         assert!(is_claude_hook_command("/opt/homebrew/bin/rtk hook claude"));
         assert!(is_claude_hook_command(
             "\"/opt/homebrew/bin/rtk\" hook claude"
+        ));
+        assert!(is_claude_hook_command(
+            "/Users/jane/My\\ Apps/rtk hook claude"
         ));
     }
 

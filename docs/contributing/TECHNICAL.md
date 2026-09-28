@@ -121,6 +121,12 @@ rewrite_cmd::run(cmd)                              [src/hooks/rewrite_cmd.rs]
   |     → None → exit(1)          (no RTK equivalent, passthrough)
   |     → Some + Allow → print, exit(0)
   |     → Some + Ask   → print, exit(3)
+  |  4. ApprovalOwner::from_env() — RTK_REWRITE_HOST names the calling
+  |     delegate. For one that gates the rewritten command itself
+  |     (OpenClaw), a Default ask renders as exit(0) instead of exit(3); an
+  |     explicit Ask rule still exits 3 so the host can prompt. Deny and
+  |     passthrough are untouched, so this never relaxes a deny or drops an
+  |     explicit ask.
   |
   v
 rewrite_command(cmd, excluded)                     [src/discover/registry.rs]
@@ -166,7 +172,7 @@ rewrite_segment(seg, excluded)                     [src/discover/registry.rs]
   |  Step 4 — Already RTK → return as-is
   |
   |  Step 5 — Special cases (short-circuit before classification)
-  |  head -N / --lines=N → rewrite_line_range() → "rtk read file --max-lines N"
+  |  head -N / -n N / --lines[= ]N / bare → rewrite_line_range() → "rtk read file --head-lines N"
   |  tail -N / -n N / --lines N → rewrite_line_range() → "rtk read file --tail-lines N"
   |  head/tail with unsupported flag (-c, -f) → None (skip rewrite)
   |  cat with incompatible flag (-A, -v, -e) → None (skip rewrite)
@@ -320,7 +326,7 @@ Start here, then drill down into each README for file-level details.
 | [`cursor/`](../hooks/cursor/README.md) | Cursor IDE | Shell hook, empty JSON response requirement |
 | [`cline/`](../hooks/cline/README.md) | Cline / Roo Code | Rules file (prompt-level, no programmatic hook) |
 | [`windsurf/`](../hooks/windsurf/README.md) | Windsurf / Cascade | Rules file (workspace-scoped) |
-| [`codex/`](../hooks/codex/README.md) | OpenAI Codex CLI | Awareness document, AGENTS.md integration |
+| [`codex/`](../hooks/codex/README.md) | OpenAI Codex CLI | Native `PreToolUse` processor, hooks.json registration, AGENTS.md awareness |
 | [`opencode/`](../hooks/opencode/README.md) | OpenCode | TypeScript plugin, zx library, in-place mutation |
 | [`kilocode/`](../hooks/kilocode/README.md) | Kilo Code | TypeScript plugin, `tool.execute.before`, in-place mutation |
 
@@ -339,7 +345,7 @@ RTK supports the following LLM agents through hook integrations:
 | Gemini CLI | Rust binary | `rtk hook gemini` reads JSON | Yes (`hookSpecificOutput`) |
 | Cline/Roo Code | Rules file | Prompt-level guidance | N/A (prompt) |
 | Windsurf | Rules file | Prompt-level guidance | N/A (prompt) |
-| Codex CLI | Awareness doc | AGENTS.md integration | N/A (prompt) |
+| Codex CLI | Rust binary | `rtk hook codex` reads JSON | Yes (`updatedInput`) |
 | OpenCode | TS plugin | `tool.execute.before` event | Yes (in-place mutation) |
 | Kilo Code | TS plugin | `tool.execute.before` event | Yes (in-place mutation) |
 
